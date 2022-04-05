@@ -10,6 +10,8 @@ library(ggplot2)
 library(GGally)
 library(reshape2)
 library(cowplot)
+library(WGCNA)
+
 
 # Set working directory
 setwd('~/Documents/Intomics/')
@@ -40,17 +42,19 @@ expr_mat <- expr_df %>%
 rownames(expr_mat) <- expr_df$Gene
 
 
-
 # Getting an idea about the data distribution to understand what constitutes high/low expression
 ggplot(expr_data, aes(x = Tissue, y = nTPM)) +
   geom_boxplot() + 
-  scale_y_continuous(trans = "log1p", breaks = c(0,100,1000,2000,5000,10000,100000)) +
-  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) + theme_bw()
+  scale_y_continuous(trans = "log1p", breaks = c(0,10,100,1000,10000,100000)) +
+  theme_bw() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# Note that most genes have expression in the range 0-100. The median is around 5.
+
 
 
 ### First, naive analysis (also good as sanity check) ----
-# Simply calculating Pearson correlation to all genes
-pcc <- sapply(names(gene_trans), function(gene) {cor(expr_mat[names(which(gene_trans == 'IGF2R')),], expr_mat[gene,], method = 'pearson')})
+# Simply calculating Pearson correlation from IGF2R to all genes
+pcc <- sapply(names(gene_trans), function(gene) {stats::cor(expr_mat[names(which(gene_trans == 'IGF2R')),], expr_mat[gene,], method = 'pearson')})
 
 top_genes <- pcc[pcc > 0.75] %>% 
   sort(decreasing = T)
@@ -61,7 +65,7 @@ top_genes <- pcc[pcc > 0.75] %>%
 gene_trans[names(top_genes)] %>% head()
 
 
-# Plot an example scatter plots for top six non-self
+# Plot example scatter plots for top six non-self genes
 plots <- lapply(2:7, function(i) {
   expr_mat %>% t() %>% as.data.frame() %>%
     ggplot(aes_string(x = names(top_genes[1]), y = names(top_genes[i]))) +
@@ -73,5 +77,138 @@ plots <- lapply(2:7, function(i) {
 
 plot_grid(plotlist = plots, ncol = 3)
 
+# It looks good overall, also note that some of these other genes have generally higher expression than others
 
+
+
+
+
+### A more well-thought out approach (based on WGCNA) ----
+
+# All pairwise correlations have to be determined in order to generate networks
+# Modules can then be defined by hierarchical clustering
+
+# The following setting is needed according to WGCNA documentation
+options(stringsAsFactors = FALSE)
+
+# Check data quality
+gsg <- goodSamplesGenes(t(expr_mat), verbose = 3)
+table(gsg$goodGenes) # 225 genes are not "good"
+table(gsg$goodSamples)
+
+# We remove those genes and also transpose to fit WGCNA's functions
+expr_mat_filtered <- t(expr_mat)[gsg$goodSamples, gsg$goodGenes]
+
+# Check that IGF2R is still there
+# names(which(gene_trans == 'IGF2R')) %in% colnames(expr_mat_filtered)
+
+
+# To construct the network, we need to define a soft tresholding power suitable for 
+# biological (typically scale free) networks
+
+# Call the network topology analysis function with a set of powers
+sft = pickSoftThreshold(expr_mat_filtered, powerVector = c(c(1:10), seq(from = 12, to=20, by=2)), verbose = 5)
+
+# Plot the results
+par(mfrow = c(1,2));
+
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers, cex=0.9, col="red");
+
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=0.9, col="red")
+
+
+# We pick the power 4 based on these plots and guidelines from WGCNA
+
+
+
+# Now, we construct the network - largely using default values
+# Analysis will be done in one block
+net <- blockwiseModules(expr_mat_filtered, maxBlockSize = 21000,
+                        power = 4, TOMType = "unsigned", minModuleSize = 30,
+                        reassignThreshold = 0, mergeCutHeight = 0.25,
+                        numericLabels = TRUE,
+                        saveTOMs = TRUE,
+                        saveTOMFileBase = "DEgradeTx",
+                        verbose = 3)
+
+# Getting an overview of the total number of modules and their sizes
+table(net$colors)
+
+
+# Visualizing modules with dendrogram
+# Convert labels to colors for plotting
+mergedColors = labels2colors(net$colors)
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]],
+                    "Module colors",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+# Saving some of the key information
+moduleLabels = net$colors
+moduleColors = labels2colors(net$colors)
+MEs = net$MEs
+geneTree = net$dendrograms[[1]]
+
+# Check which module IGF2R belongs to - and for sanity which modules, the top 20 correlated genes belong to
+moduleLabels[names(which(gene_trans == 'IGF2R'))]
+table(moduleLabels[names(top_genes[2:21])]) # Module 3 looks like the interesting one (1,882 genes)
+
+
+# Identification of important genes in module 3
+modNames = substring(names(MEs), 3)
+geneModuleMembership = as.data.frame(cor(expr_mat_filtered, MEs, use = "p"));
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nrow(expr_mat_filtered)));
+
+
+names(geneModuleMembership) = paste("MM", modNames, sep="");
+names(MMPvalue) = paste("p.MM", modNames, sep="");
+
+# Order on importance among genes in module
+module3_membership <- geneModuleMembership[moduleLabels=="3",]
+mod_order <- order(module3_membership$MM3, decreasing = T)
+
+# Extract module 3 genes in order by importance
+module3_genes <- rownames(module3_membership)[mod_order]
+
+# Look for position of IGF2R
+which(module3_genes == names(which(gene_trans == 'IGF2R'))) # Around third-in
+
+
+# Make a table to show which genes co-express with IGF2R - simply taking all of module 3's genes here
+cbind.data.frame("Gene" = module3_genes, "Gene.symbol" = gene_trans[module3_genes]) %>%
+  write.csv(file = '~/Documents/Intomics/DEgradeTargets/Large_unfiltered_geneset.csv', row.names = F)
+
+# Also get median expression for each of these across tissues
+# Also get PCC to IGF2R (filter limit = 0.5?)
+
+
+# Make filter on both of these and remake data table
+
+
+# Look specifically for PCSK9, TARDBP, UCP2, DCN, APOD - plots and correlation
+genes_of_interest <- c('PCSK9', 'TARDBP', 'UCP2', 'DCN', 'APOD')
+plots <- lapply(genes_of_interest, function(g) {
+  expr_mat %>% t() %>% as.data.frame() %>%
+    ggplot(aes_string(x = names(top_genes[1]), y = names(which(gene_trans == g)))) +
+    geom_point() + theme_bw() +
+    xlab(gene_trans[names(top_genes[1])]) + ylab(g) +
+    # ggtitle('Correlation across tissues') +
+    scale_x_continuous(trans = 'log1p') + scale_y_continuous(trans = 'log1p')
+})
+
+plot_grid(plotlist = plots, ncol = 3)
+pcc[names(gene_trans[match(genes_of_interest, gene_trans)])]
+
+
+# Data visualizations they can use.
 

@@ -11,6 +11,7 @@ library(GGally)
 library(reshape2)
 library(cowplot)
 library(WGCNA)
+library(hpar)
 
 
 # Set working directory
@@ -53,8 +54,8 @@ ggplot(expr_data, aes(x = Tissue, y = nTPM)) +
 
 
 ### First, naive analysis (also good as sanity check) ----
-# Simply calculating Pearson correlation from IGF2R to all genes
-pcc <- sapply(names(gene_trans), function(gene) {stats::cor(expr_mat[names(which(gene_trans == 'IGF2R')),], expr_mat[gene,], method = 'pearson')})
+# Simply calculating Pearson correlation from IGF2R to all genes (ignoring any NA's)
+pcc <- sapply(names(gene_trans), function(gene) {stats::cor(expr_mat[names(which(gene_trans == 'IGF2R')),], expr_mat[gene,], method = 'pearson', use = "pairwise.complete.obs")})
 
 top_genes <- pcc[pcc > 0.75] %>% 
   sort(decreasing = T)
@@ -188,14 +189,67 @@ which(module3_genes == names(which(gene_trans == 'IGF2R'))) # Around third-in
 cbind.data.frame("Gene" = module3_genes, "Gene.symbol" = gene_trans[module3_genes]) %>%
   write.csv(file = '~/Documents/Intomics/DEgradeTargets/Large_unfiltered_geneset.csv', row.names = F)
 
-# Also get median expression for each of these across tissues
-# Also get PCC to IGF2R (filter limit = 0.5?)
 
 
-# Make filter on both of these and remake data table
+### Adding additional filtering steps on top of WGCNA ----
+
+# Account for the median(?) expression level per gene to only get those with reasonably high expression (filter limit = 5(?))
+median_expr_mod3 <- matrixStats::rowMedians(expr_mat[module3_genes,])
+
+# Account for Pearson correlation to IGF2R (filter limit = 0.5(?))
+pcc_mod3 <- pcc[module3_genes]
 
 
-# Look specifically for PCSK9, TARDBP, UCP2, DCN, APOD - plots and correlation
+# Filter (somewhat crudely) and remake data tables
+module3_subset1 <- cbind.data.frame("Gene" = module3_genes, 
+                                    "Gene.symbol" = gene_trans[module3_genes], 
+                                    "Median.expr" = median_expr_mod3,
+                                    "PCC" = pcc_mod3) %>%
+  filter(PCC > 0.5 & Median.expr > 5)
+
+write.csv(module3_subset1, file = '~/Documents/Intomics/DEgradeTargets/Large_filtered_lvl1_geneset.csv', row.names = F)
+
+
+
+
+# Get cellular location from HPA - we are only interested in extracellular (sectreted or transmembrane)
+# Note: These data are highly complex, but it can support some filtering?
+
+# Get data from subcellular location set
+loc_mod3 <- getHpa(id = c(module3_genes),
+                   hpadata = "hpaSubcellularLoc")
+loc_relevant <- loc_mod3$Gene[grep('secreted|plasma membrane', tolower(loc_mod3$Main.location))]
+
+# Get secretome data
+sec_mod3 <- getHpa(id = c(module3_genes),
+                   hpadata = "hpaSecretome")
+sec_relevant <- sec_mod3$Gene[grep('secreted|membrane', tolower(sec_mod3$Protein.class))]
+
+
+# Add location filtering and write table - very small set of genes kept here
+module3_subset2 <- module3_subset1 %>%
+  filter(Gene %in% loc_relevant & Gene %in% sec_relevant)
+
+write.csv(module3_subset2, file = '~/Documents/Intomics/DEgradeTargets/Large_filtered_lvl2_geneset.csv', row.names = F)
+
+
+
+# Make a plot for those passing the last filter
+plots <- lapply(module3_subset2$Gene, function(g) {
+  expr_mat %>% t() %>% as.data.frame() %>%
+    ggplot(aes_string(x = names(top_genes[1]), y = g)) +
+    geom_point() + theme_bw() +
+    xlab(gene_trans[names(top_genes[1])]) + ylab(gene_trans[g]) +
+    # ggtitle('Correlation across tissues') +
+    scale_x_continuous(trans = 'log1p') + scale_y_continuous(trans = 'log1p')
+})
+plot_grid(plotlist = plots, ncol = 3)
+
+
+
+
+
+### Look specifically for PCSK9, TARDBP, UCP2, DCN, APOD - plots and correlation ----
 genes_of_interest <- c('PCSK9', 'TARDBP', 'UCP2', 'DCN', 'APOD')
 plots <- lapply(genes_of_interest, function(g) {
   expr_mat %>% t() %>% as.data.frame() %>%
@@ -210,5 +264,11 @@ plot_grid(plotlist = plots, ncol = 3)
 pcc[names(gene_trans[match(genes_of_interest, gene_trans)])]
 
 
-# Data visualizations they can use.
 
+
+### Other data visualizations they can use ---
+# Heatmaps?
+
+
+
+### Future optimization: Do something with single cell data in high-expression tissue based on plots?
